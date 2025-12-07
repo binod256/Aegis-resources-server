@@ -1,0 +1,23 @@
+{
+  "name": "aegisai-resources-server",
+  "version": "1.0.0",
+  "description": "Static resource endpoints for the AegisAI ACP agent (risk_sentinel, gas_execution_optimizer, strategy_safety_audit, market_intelligence_feed, portfolio_rebalancer).",
+  "main": "resources-server.js",
+  "scripts": {
+    "start": "node resources-server.js",
+    "dev": "nodemon resources-server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "license": "MIT"
+}
