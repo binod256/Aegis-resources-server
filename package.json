@@ -1,23 +1,38 @@
 {
-  "name": "aegisai-resources-server",
+  "name": "aegisai-acp-provider",
   "version": "1.0.0",
-  "description": "Static resource endpoints for the AegisAI ACP agent (risk_sentinel, gas_execution_optimizer, strategy_safety_audit, market_intelligence_feed, portfolio_rebalancer).",
-  "main": "resources-server.js",
+  "description": "AegisAI — Deep pre-trade risk, liquidity intelligence, and execution analysis agent for Base chain (Virtual Protocol ACP).",
+  "main": "seller.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node resources-server.js",
-    "dev": "nodemon resources-server.js"
+    "start": "node seller.js",
+    "resources": "node resources-server.js",
+    "dev": "concurrently \"npm run resources\" \"npm run start\""
   },
+  "keywords": [
+    "virtual-protocol",
+    "acp",
+    "base",
+    "defi",
+    "risk",
+    "liquidity",
+    "aerodrome",
+    "uniswap-v3",
+    "agent"
+  ],
+  "author": "AegisAI",
+  "license": "MIT",
   "dependencies": {
-    "cors": "^2.8.5",
+    "@virtuals-protocol/acp-node": "0.3.0-beta.14",
     "dotenv": "^16.4.5",
-    "express": "^4.21.2",
-    "morgan": "^1.10.0"
+    "ethers": "^6.13.2",
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "concurrently": "^8.2.2"
   },
   "engines": {
-    "node": ">=18.x"
-  },
-  "license": "MIT"
+    "node": ">=18.0.0"
+  }
 }

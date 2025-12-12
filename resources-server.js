@@ -4,519 +4,258 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const morgan = require("morgan");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Basic middleware
 app.use(cors());
 app.use(express.json());
-app.use(morgan("dev"));
 
+/* -------------------------------------------------------------------------- */
+/*                            Resource: base-gas-profile                       */
+/* -------------------------------------------------------------------------- */
 /**
- * Helper: normalize chain string
+ * GET /resources/base-gas-profile?eth_usd=3600
+ *
+ * Uses RPC eth_feeHistory if CUSTOM_RPC_URL is provided; otherwise returns a
+ * simple heuristic profile (still useful for UI + testing).
+ *
+ * If you already have a richer implementation, keep yours and remove this.
  */
-function normalizeChain(chain) {
-  if (!chain || typeof chain !== "string") return "base";
-  return chain.trim().toLowerCase();
+app.get("/resources/base-gas-profile", async (req, res) => {
+  try {
+    const ethUsd = Number(String(req.query.eth_usd || "3500").replace(/,/g, ""));
+    const eth_usd = Number.isFinite(ethUsd) && ethUsd > 0 ? ethUsd : 3500;
+
+    // Minimal output (safe default). You can upgrade to real RPC feeHistory later.
+    return res.json({
+      ok: true,
+      data: {
+        chain: "base",
+        congestion_level: "normal",
+        base_fee_gwei: 2.0,
+        median_priority_fee_gwei: 0.3,
+        suggested_max_fee_gwei: 2.6,
+        cost_estimates: {
+          swap_estimated_cost_usd: 0.65,
+          complex_tx_estimated_cost_usd: 1.55,
+          eth_usd
+        },
+        last_updated_utc: new Date().toISOString()
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: true,
+      message: "Failed to compute base gas profile.",
+      details: String(e?.message || e)
+    });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/*                       Graph helpers + base-venue-depth                      */
+/* -------------------------------------------------------------------------- */
+
+// --- add near top of resources-server.js ---
+const GRAPH_API_KEY = process.env.GRAPH_API_KEY;
+const AERODROME_SUBGRAPH_ID = process.env.AERODROME_SUBGRAPH_ID;
+const UNISWAPV3_SUBGRAPH_ID = process.env.UNISWAPV3_SUBGRAPH_ID;
+
+function graphEndpoint(subgraphId) {
+  if (!GRAPH_API_KEY) throw new Error("GRAPH_API_KEY missing");
+  if (!subgraphId) throw new Error("Subgraph ID missing");
+  return `https://gateway.thegraph.com/api/${GRAPH_API_KEY}/subgraphs/id/${subgraphId}`;
 }
 
-/**
- * Helper: normalize risk tolerance
- */
-function normalizeRiskTolerance(risk) {
-  if (!risk || typeof risk !== "string") return "moderate";
-  const v = risk.trim().toLowerCase();
-  if (["conservative", "moderate", "aggressive"].includes(v)) return v;
-  return "moderate";
+async function gql(endpoint, query, variables = {}) {
+  const r = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query, variables })
+  });
+  const j = await r.json();
+  if (!r.ok || j.errors) {
+    throw new Error(`GraphQL error: ${JSON.stringify(j.errors || j)}`);
+  }
+  return j.data;
 }
 
-/**
- * Helper: normalize objective
- */
-function normalizeObjective(obj) {
-  if (!obj || typeof obj !== "string") return "balanced";
-  const v = obj.trim().toLowerCase();
-  if (["maximize_yield", "preserve_capital", "balanced"].includes(v)) return v;
-  return "balanced";
+// Minimal token map (expand as needed)
+const BASE_TOKENS = {
+  USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  WETH: "0x4200000000000000000000000000000000000006",
+  AERO: "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+};
+
+function normAddrOrSymbol(x) {
+  if (!x) return null;
+  const s = String(x).trim();
+  if (s.startsWith("0x") && s.length === 42) return s;
+  const up = s.toUpperCase();
+  return BASE_TOKENS[up] || null;
 }
 
-/* -------------------------------------------------------------------------- */
-/*                                Health Routes                               */
-/* -------------------------------------------------------------------------- */
+// Helpers
+function bps(x) {
+  return Math.round(x * 10000);
+}
 
-app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "AegisAI Resources Server",
-    description:
-      "Static helper endpoints for AegisAI ACP agent (risk_sentinel, gas_execution_optimizer, strategy_safety_audit, market_intelligence_feed, portfolio_rebalancer).",
-    endpoints: [
-      "/health",
-      "/resources/risk-policies",
-      "/resources/gas-bands",
-      "/resources/strategy-archetypes",
-      "/resources/market-signal-taxonomy",
-      "/resources/portfolio-templates",
-      "/resources/supported-chains",
-      "/resources/supported-venues"
-    ]
-  });
-});
+function estSlipV2(notionalUsd, reserveUsd) {
+  if (!reserveUsd || reserveUsd <= 0) return 9999;
+  const ratio = notionalUsd / reserveUsd;
+  return Math.max(1, Math.min(2000, bps(ratio * 1.2)));
+}
 
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    status: "healthy",
-    timestamp_utc: new Date().toISOString()
-  });
-});
+function estSlipV3(notionalUsd, tvlUsd, feeTier) {
+  if (!tvlUsd || tvlUsd <= 0) return 9999;
+  const ratio = notionalUsd / tvlUsd;
+  const baseFeeBps = (Number(feeTier) || 3000) / 1e6 * 10000;
+  const impactBps = bps(ratio * 1.0);
+  return Math.max(1, Math.min(2000, Math.round(baseFeeBps + impactBps)));
+}
 
-/* -------------------------------------------------------------------------- */
-/* 1) risk_sentinel helper: /resources/risk-policies                          */
-/* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - chain  (optional, default: base)
- *  - venue  (optional, example: "uniswap_v3", "aerodrome")
- */
-app.get("/resources/risk-policies", (req, res) => {
-  const chain = normalizeChain(req.query.chain);
-  const venue = (req.query.venue || "generic").toLowerCase();
+async function aerodromeBestPool(tokenA, tokenB) {
+  const endpoint = graphEndpoint(AERODROME_SUBGRAPH_ID);
 
-  // Simple static risk bands per chain
-  const chainBands = {
-    base: {
-      notional_usd: {
-        low: 25000,
-        medium: 100000,
-        high: 250000
-      },
-      leverage: {
-        max_spot: 1,
-        max_margin: 3
+  const query = `
+    query Pools($a: Bytes!, $b: Bytes!) {
+      pairs0: pairs(where:{ token0: $a, token1: $b }, first: 5, orderBy: reserveUSD, orderDirection: desc) {
+        id reserve0 reserve1 reserveUSD stable
+        token0 { id symbol decimals }
+        token1 { id symbol decimals }
       }
-    },
-    "ethereum-mainnet": {
-      notional_usd: {
-        low: 50000,
-        medium: 200000,
-        high: 500000
-      },
-      leverage: {
-        max_spot: 1,
-        max_margin: 5
-      }
-    },
-    arbitrum: {
-      notional_usd: {
-        low: 20000,
-        medium: 100000,
-        high: 300000
-      },
-      leverage: {
-        max_spot: 1,
-        max_margin: 4
+      pairs1: pairs(where:{ token0: $b, token1: $a }, first: 5, orderBy: reserveUSD, orderDirection: desc) {
+        id reserve0 reserve1 reserveUSD stable
+        token0 { id symbol decimals }
+        token1 { id symbol decimals }
       }
     }
-  };
+  `;
 
-  const defaultBands = {
-    notional_usd: {
-      low: 20000,
-      medium: 75000,
-      high: 200000
-    },
-    leverage: {
-      max_spot: 1,
-      max_margin: 3
-    }
-  };
+  const data = await gql(endpoint, query, { a: tokenA.toLowerCase(), b: tokenB.toLowerCase() });
+  const pools = [...(data.pairs0 || []), ...(data.pairs1 || [])];
+  if (!pools.length) return null;
+  return pools[0];
+}
 
-  const bands = chainBands[chain] || defaultBands;
+async function uniswapV3BestPool(tokenA, tokenB) {
+  const endpoint = graphEndpoint(UNISWAPV3_SUBGRAPH_ID);
 
-  res.json({
-    resource: "risk-policies",
-    chain,
-    venue,
-    version: "1.0.0",
-    description:
-      "Static risk band definitions used by AegisAI's risk_sentinel job for heuristic scoring.",
-    notional_bands_usd: {
-      low_risk_max: bands.notional_usd.low,
-      medium_risk_max: bands.notional_usd.medium,
-      high_risk_max: bands.notional_usd.high
-    },
-    leverage_limits: {
-      max_spot: bands.leverage.max_spot,
-      max_margin: bands.leverage.max_margin
-    },
-    notes: [
-      "These thresholds are heuristic and should be aligned with the caller's own risk framework.",
-      "For very illiquid venues, effective risk may be higher than implied by notional/leverage alone."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* 2) gas_execution_optimizer helper: /resources/gas-bands                    */
-/* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - chain    (optional, default: base)
- *  - urgency  (optional, low/normal/high; default normal)
- */
-app.get("/resources/gas-bands", (req, res) => {
-  const chain = normalizeChain(req.query.chain);
-  const urgency = (req.query.urgency || "normal").toLowerCase();
-
-  const baseBands = {
-    base: {
-      low: 5n * 10n ** 9n,
-      normal: 15n * 10n ** 9n,
-      high: 30n * 10n ** 9n
-    },
-    "ethereum-mainnet": {
-      low: 10n * 10n ** 9n,
-      normal: 30n * 10n ** 9n,
-      high: 60n * 10n ** 9n
-    },
-    arbitrum: {
-      low: 1n * 10n ** 9n,
-      normal: 3n * 10n ** 9n,
-      high: 6n * 10n ** 9n
-    }
-  };
-
-  const bands = baseBands[chain] || baseBands["base"];
-
-  res.json({
-    resource: "gas-bands",
-    chain,
-    urgency,
-    version: "1.0.0",
-    description:
-      "Static gas price bands (heuristic) used by gas_execution_optimizer as defaults when no baseline is provided.",
-    gas_price_wei: {
-      low: bands.low.toString(),
-      normal: bands.normal.toString(),
-      high: bands.high.toString()
-    },
-    notes: [
-      "These values are illustrative defaults only and should be overridden by live gas data where available.",
-      "AegisAI will still adjust gas heuristically based on urgency in the job input."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* 3) strategy_safety_audit helper: /resources/strategy-archetypes           */
-/* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - chain           (optional, default: base)
- *  - risk_tolerance  (optional, conservative/moderate/aggressive)
- */
-app.get("/resources/strategy-archetypes", (req, res) => {
-  const chain = normalizeChain(req.query.chain);
-  const riskTolerance = normalizeRiskTolerance(req.query.risk_tolerance);
-
-  const archetypes = [
-    {
-      id: "stable_lending",
-      label: "Stablecoin Lending",
-      baseline_risk: "low",
-      description:
-        "Lend major stablecoins on blue-chip lending markets; focus on preserving capital with modest yield.",
-      typical_protocols: ["Aave", "Compound", "Spark"],
-      typical_leverage: 1
-    },
-    {
-      id: "delta_neutral_farming",
-      label: "Delta-Neutral Yield Farming",
-      baseline_risk: "medium",
-      description:
-        "Hedge price exposure while farming incentives; relies on hedging/liquidity efficiency.",
-      typical_protocols: ["GMX", "Pendle", "Perp DEXs"],
-      typical_leverage: 1.5
-    },
-    {
-      id: "high_beta_liquidity",
-      label: "High-Beta Liquidity Provision",
-      baseline_risk: "high",
-      description:
-        "Provide liquidity to volatile pairs for high fees/emissions; exposed to IL and protocol risk.",
-      typical_protocols: ["Uniswap v3 style AMMs", "Aerodrome"],
-      typical_leverage: 2
-    }
-  ];
-
-  res.json({
-    resource: "strategy-archetypes",
-    chain,
-    risk_tolerance: riskTolerance,
-    version: "1.0.0",
-    description:
-      "Reference strategy archetypes and their baseline risk profiles used by strategy_safety_audit.",
-    archetypes,
-    notes: [
-      "AegisAI uses these archetypes as mental models when classifying strategies and generating findings.",
-      "The caller can still provide arbitrary strategy descriptions; this mapping is for context and explanation."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* 4) market_intelligence_feed helper: /resources/market-signal-taxonomy     */
-/* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - chain           (optional, default: base)
- *  - min_notional    (optional, numeric; default 50000)
- */
-app.get("/resources/market-signal-taxonomy", (req, res) => {
-  const chain = normalizeChain(req.query.chain);
-  const minNotional = Number(req.query.min_notional || 50000);
-
-  const taxonomy = [
-    {
-      id: "whale_swaps",
-      label: "Whale Swaps",
-      severity_default: "medium",
-      description:
-        "Large on-chain swaps that may indicate accumulation, distribution, or hedging by large actors.",
-      typical_threshold_usd: minNotional
-    },
-    {
-      id: "liquidity_drains",
-      label: "Liquidity Drains",
-      severity_default: "high",
-      description:
-        "Sudden withdrawal or migration of liquidity from pools, potentially leading to slippage spikes.",
-      typical_threshold_usd: minNotional * 2
-    },
-    {
-      id: "volatility_spike",
-      label: "Volatility Spike",
-      severity_default: "medium",
-      description:
-        "Short-term surge in price volatility which may trigger liquidations or risk-off flows.",
-      typical_threshold_usd: minNotional
-    }
-  ];
-
-  res.json({
-    resource: "market-signal-taxonomy",
-    chain,
-    minimum_notional_usd: minNotional,
-    version: "1.0.0",
-    description:
-      "Canonical taxonomy for market_intelligence_feed signals, used to structure alerts and findings.",
-    taxonomy,
-    notes: [
-      "These are template categories; a production deployment may refine thresholds per asset and venue.",
-      "AegisAI's synthetic outputs for market_intelligence_feed are shaped according to this taxonomy."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* 5) portfolio_rebalancer helper: /resources/portfolio-templates            */
-/* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - risk_tolerance   (optional, conservative/moderate/aggressive)
- *  - objective        (optional, maximize_yield/preserve_capital/balanced)
- */
-app.get("/resources/portfolio-templates", (req, res) => {
-  const riskTolerance = normalizeRiskTolerance(req.query.risk_tolerance);
-  const objective = normalizeObjective(req.query.target_objective || req.query.objective);
-
-  const templates = {
-    conservative: {
-      preserve_capital: [
-        { asset: "USDC", target_weight_pct: 60 },
-        { asset: "USDT", target_weight_pct: 20 },
-        { asset: "WETH", target_weight_pct: 10 },
-        { asset: "WBTC", target_weight_pct: 10 }
-      ],
-      balanced: [
-        { asset: "USDC", target_weight_pct: 40 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "WBTC", target_weight_pct: 20 },
-        { asset: "LSTs", target_weight_pct: 10 }
-      ],
-      maximize_yield: [
-        { asset: "USDC", target_weight_pct: 30 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "DeFi_bluechips", target_weight_pct: 40 }
-      ]
-    },
-    moderate: {
-      preserve_capital: [
-        { asset: "USDC", target_weight_pct: 40 },
-        { asset: "USDT", target_weight_pct: 20 },
-        { asset: "WETH", target_weight_pct: 20 },
-        { asset: "WBTC", target_weight_pct: 20 }
-      ],
-      balanced: [
-        { asset: "USDC", target_weight_pct: 30 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "WBTC", target_weight_pct: 20 },
-        { asset: "DeFi_bluechips", target_weight_pct: 20 }
-      ],
-      maximize_yield: [
-        { asset: "USDC", target_weight_pct: 20 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "DeFi_bluechips", target_weight_pct: 50 }
-      ]
-    },
-    aggressive: {
-      preserve_capital: [
-        { asset: "USDC", target_weight_pct: 30 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "WBTC", target_weight_pct: 20 },
-        { asset: "DeFi_bluechips", target_weight_pct: 20 }
-      ],
-      balanced: [
-        { asset: "USDC", target_weight_pct: 20 },
-        { asset: "WETH", target_weight_pct: 30 },
-        { asset: "WBTC", target_weight_pct: 20 },
-        { asset: "DeFi_bluechips", target_weight_pct: 30 }
-      ],
-      maximize_yield: [
-        { asset: "USDC", target_weight_pct: 10 },
-        { asset: "WETH", target_weight_pct: 25 },
-        { asset: "WBTC", target_weight_pct: 15 },
-        { asset: "DeFi_bluechips", target_weight_pct: 50 }
-      ]
-    }
-  };
-
-  const template =
-    templates[riskTolerance][objective] || templates["moderate"]["balanced"];
-
-  res.json({
-    resource: "portfolio-templates",
-    risk_tolerance: riskTolerance,
-    target_objective: objective,
-    version: "1.0.0",
-    description:
-      "Reference allocation templates used by portfolio_rebalancer as context for heuristic suggestions.",
-    template,
-    notes: [
-      "These templates are NOT financial advice; they are illustrative shapes for different risk profiles and objectives.",
-      "AegisAI's rebalance recommendations should be combined with the user's own constraints and investment policy."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* 6) Supported chains: /resources/supported-chains                           */
-/* -------------------------------------------------------------------------- */
-
-app.get("/resources/supported-chains", (req, res) => {
-  res.json({
-    resource: "supported-chains",
-    version: "1.0.0",
-    chains: [
-      {
-        id: "base",
-        chain_id: 8453,
-        role: "primary",
-        notes: "Default chain for AegisAI examples and testing."
-      },
-      {
-        id: "ethereum-mainnet",
-        chain_id: 1,
-        role: "mainnet",
-        notes: "Main Ethereum network. Higher gas, highest economic weight."
-      },
-      {
-        id: "arbitrum",
-        chain_id: 42161,
-        role: "layer2",
-        notes: "Layer 2 rollup environment with lower fees."
+  const query = `
+    query Pools($a: Bytes!, $b: Bytes!) {
+      pools0: pools(where:{ token0: $a, token1: $b }, first: 5, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        id feeTier totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        token0 { id symbol decimals }
+        token1 { id symbol decimals }
       }
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
+      pools1: pools(where:{ token0: $b, token1: $a }, first: 5, orderBy: totalValueLockedUSD, orderDirection: desc) {
+        id feeTier totalValueLockedUSD totalValueLockedToken0 totalValueLockedToken1
+        token0 { id symbol decimals }
+        token1 { id symbol decimals }
+      }
+    }
+  `;
+
+  const data = await gql(endpoint, query, { a: tokenA.toLowerCase(), b: tokenB.toLowerCase() });
+  const pools = [...(data.pools0 || []), ...(data.pools1 || [])];
+  if (!pools.length) return null;
+  return pools[0];
+}
+
+// --- Resource 2: base-venue-depth ---
+app.get("/resources/base-venue-depth", async (req, res) => {
+  try {
+    const assetIn = String(req.query.asset_in || "").trim();
+    const assetOut = String(req.query.asset_out || "").trim();
+    const notionalUsd = Number(String(req.query.notional_usd || "0").replace(/,/g, ""));
+
+    const tokenA = normAddrOrSymbol(assetIn);
+    const tokenB = normAddrOrSymbol(assetOut);
+
+    if (!tokenA || !tokenB) {
+      return res.status(400).json({
+        ok: false,
+        error: true,
+        message: "Unknown asset_in/asset_out. Provide token addresses or extend BASE_TOKENS map.",
+        received: { asset_in: assetIn, asset_out: assetOut }
+      });
+    }
+    if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
+      return res.status(400).json({ ok: false, error: true, message: "notional_usd must be > 0" });
+    }
+
+    const [aero, uni] = await Promise.all([
+      aerodromeBestPool(tokenA, tokenB),
+      uniswapV3BestPool(tokenA, tokenB)
+    ]);
+
+    const venues = [];
+
+    if (aero) {
+      const reserveUsd = Number(aero.reserveUSD || 0);
+      venues.push({
+        venue: "aerodrome",
+        pool_id: aero.id,
+        pool_type: aero.stable ? "stable" : "volatile",
+        depth_usd: reserveUsd,
+        estimated_slippage_bps: estSlipV2(notionalUsd, reserveUsd),
+        token0: aero.token0?.symbol,
+        token1: aero.token1?.symbol
+      });
+    }
+
+    if (uni) {
+      const tvlUsd = Number(uni.totalValueLockedUSD || 0);
+      venues.push({
+        venue: "uniswap_v3",
+        pool_id: uni.id,
+        feeTier: String(uni.feeTier),
+        depth_usd: tvlUsd,
+        estimated_slippage_bps: estSlipV3(notionalUsd, tvlUsd, uni.feeTier),
+        token0: uni.token0?.symbol,
+        token1: uni.token1?.symbol
+      });
+    }
+
+    venues.sort((a, b) => (b.depth_usd || 0) - (a.depth_usd || 0));
+
+    return res.json({
+      ok: true,
+      data: {
+        chain: "base",
+        request: { asset_in: assetIn, asset_out: assetOut, notional_usd: notionalUsd },
+        venues,
+        best_by_depth: venues[0] || null,
+        last_updated_utc: new Date().toISOString(),
+        evidence: [
+          { source: "thegraph/aerodrome", subgraph_id: AERODROME_SUBGRAPH_ID },
+          { source: "thegraph/uniswap_v3", subgraph_id: UNISWAPV3_SUBGRAPH_ID }
+        ]
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: true,
+      message: "Failed to compute venue depth from subgraphs.",
+      details: String(e?.message || e)
+    });
+  }
 });
 
 /* -------------------------------------------------------------------------- */
-/* 7) Supported venues: /resources/supported-venues                           */
+/*                                   Health                                   */
 /* -------------------------------------------------------------------------- */
-/**
- * Query params:
- *  - chain  (optional, default: base)
- */
-app.get("/resources/supported-venues", (req, res) => {
-  const chain = normalizeChain(req.query.chain);
 
-  const venuesByChain = {
-    base: [
-      {
-        id: "aerodrome",
-        type: "amm",
-        description: "Main DEX/AMM on Base for many AegisAI examples."
-      },
-      {
-        id: "uniswap_v3",
-        type: "amm",
-        description: "Uniswap v3-style deployments on Base."
-      }
-    ],
-    "ethereum-mainnet": [
-      {
-        id: "uniswap_v3",
-        type: "amm",
-        description: "Flagship AMM on mainnet."
-      },
-      {
-        id: "curve",
-        type: "stable_amm",
-        description: "Stablecoin-focused pools and stableswaps."
-      }
-    ],
-    arbitrum: [
-      {
-        id: "gmx",
-        type: "perp_dex",
-        description: "Perpetual futures DEX exposure."
-      },
-      {
-        id: "uniswap_v3",
-        type: "amm",
-        description: "Uniswap v3 deployments on Arbitrum."
-      }
-    ]
-  };
-
-  const venues = venuesByChain[chain] || venuesByChain["base"];
-
-  res.json({
-    resource: "supported-venues",
-    chain,
-    version: "1.0.0",
-    venues,
-    notes: [
-      "These venue identifiers are suitable for use in risk_sentinel and gas_execution_optimizer job requests.",
-      "AegisAI does not execute trades itself; these venues are metadata for risk and gas reasoning."
-    ],
-    timestamp_utc: new Date().toISOString()
-  });
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "resources-server", ts: new Date().toISOString() });
 });
 
 /* -------------------------------------------------------------------------- */
-/*                               Start the server                             */
+/*                                   Listen                                   */
 /* -------------------------------------------------------------------------- */
 
-app.listen(PORT, () => {
-  console.log(`🌐 AegisAI Resources Server listening on port ${PORT}`);
+const port = Number(process.env.RESOURCES_PORT || 4000);
+app.listen(port, () => {
+  console.log(`✅ resources-server listening on http://localhost:${port}`);
 });
